@@ -1,3 +1,3 @@
-# CohortSelection
+# Cohort Selection
 
-![Alt text](/Users/loverma2/Downloads/work-in-progress.png)
+![Screenshot](work-in-progress.png)
