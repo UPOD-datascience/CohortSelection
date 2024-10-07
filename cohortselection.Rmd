@@ -1,0 +1,375 @@
+---
+title: "Cohort Selection Using Electronic Health Records - Ischemic Heart Disease"
+output:
+  html_document: 
+    toc: true
+    toc_float: true
+    theme: simplex
+date: "2024-09-25"
+editor_options:
+  chunk_output_type: console
+---
+
+# Introduction
+
+This document provides a reproducible script for **constructing a cohort of patients diagnosed with Ischemic Heart Disease (IHD)** using various clinical data sources. In this study, we apply multiple selection criteria, including diagnostic codes, laboratory measurements, and medical procedures, to identify patients with IHD[. **Each criterion offers a perspective on what defines an IHD patient, which in turn can lead to differences in the cohort composition and patient characteristics.**]{.underline}
+
+It is important to note that there is no single criterion universally accepted for defining IHD. Instead, we employ a range of criteria to explore how each impacts the cohort selection process. [**The choice of criteria influences which patients are included and may yield cohorts with differing clinical profiles and demographic characteristics.**]{.underline} This document will demonstrate how these variations manifest, particularly in the summary table at the end, where we compare the characteristics of the cohorts selected by different criteria.
+
+[**The aim of this document is to provide a sclear and reproducible methodology for cohort selection.**]{.underline} By detailing each step, we enable other researchers to validate and replicate the process, fostering transparency and collaboration across our consortium.
+
+```{r message=FALSE, warning=FALSE}
+library(ProjectTemplate)
+library(arrow)
+library(tidyverse)
+library(dplyr)
+library(ggVennDiagram)
+library(gtsummary)
+
+#load.project()  
+```
+
+```{r Read data, echo=FALSE}
+setwd("L:/laupodteam/AIOS/Malin/projects/14_COHORTSELECTION")
+
+diagnose <- read_parquet("L:/laupodteam/AIOS/Malin/projects/14_COHORTSELECTION/data/pob/raw/parquet/diagnose_20230216.parquet")
+
+dbc <- read_parquet("L:/laupodteam/AIOS/Malin/projects/14_COHORTSELECTION/data/pob/raw/parquet/dbc_20230216.parquet")
+
+lab <- read_parquet("L:/laupodteam/AIOS/Malin/projects/14_COHORTSELECTION/data/pob/raw/parquet/lab_20230216.parquet")
+
+verrichtingen <- read_parquet("L:/laupodteam/AIOS/Malin/projects/14_COHORTSELECTION/data/pob/raw/parquet/verrichtingen_20230406.parquet")
+
+verrichtingscodes <- read.csv2("L:/laupodteam/AIOS/Malin/projects/14_COHORTSELECTION/data/pob/cardiale_verrichtingscodes.csv")
+
+ontslagbrieven <- read_parquet("L:/laupodteam/AIOS/Malin/projects/14_COHORTSELECTION/data/pob/raw/parquet/ontslagbrieven_20230216.parquet")
+
+patients <- read_parquet("L:/laupodteam/AIOS/Malin/projects/14_COHORTSELECTION/data/pob/raw/parquet/patients_long_20230130.parquet")
+
+med_klin <- read_parquet("L:/laupodteam/AIOS/Malin/projects/14_COHORTSELECTION/data/pob/raw/parquet/med_klin_20230216.parquet")
+
+med_poliklin <- read_parquet("L:/laupodteam/AIOS/Malin/projects/14_COHORTSELECTION/data/pob/raw/parquet/med_poliklin_20230216.parquet")
+
+```
+
+The following index and metadata columns are critical for merging datasets. Here, we define these variables for consistent use across all data sources.
+
+**Study ID** - The column name of the study ID's (pseunonymized patient IDs)
+
+**Index date** - The column name of the index date (date GP referral letter was created)
+
+```{r Select index columns, message=FALSE, warning=FALSE}
+
+index_cols <- c("studyId_0758", "indexdate")
+meta_cols <- c("studyId_0758", "aanmaakZD_date","gender", "age")
+
+```
+
+------------------------------------------------------------------------
+
+## Selection criteria for IHD
+
+The following sections describe how to identify patients of IHD from multiple sources, including diagnoses, laboratory results, and medical procedures. Selection is based on specific inclusion criteria that align with clinical definitions and codes associated with IHD.
+
+```{r Flowchart, message=FALSE, warning=FALSE}
+
+```
+
+![Flowchart IHD](images/CohortSelectionProject-IHD diagram.jpg)
+
+------------------------------------------------------------------------
+
+### 1. IHD-related DBC codes (Diagnoses and Treatment Combinations)
+
+First, we examine the DBC data for records containing relevant ICD-10 codes or diagnoses text descriptions. These codes and terms are indicative of IHD, including myocardial infarction and angina pectoris. Please change the regex terms (in Dutch) to the desired language.
+
+```{r DBC, message=FALSE, warning=FALSE}
+
+ihd_dbc <- dbc %>% 
+  filter((grepl("I20|I21|I22|I23|I24|I25", ICD10_DBC))|
+           grepl("myocardinfarct|angina pectoris|coronair|pre-infarctsyndroom|pci|cabg|hartinfarct", DBC_tekst)) %>% 
+  select(all_of(index_cols), Begindatum_DBC, Omschrijving_Diagnose, DBC_tekst, ICD10_DBC) %>% 
+  distinct(studyId_0758, indexdate, Begindatum_DBC) %>% 
+  mutate(date_diff = as.Date(Begindatum_DBC) - as.Date(indexdate)) %>% 
+  filter(date_diff > -1 & date_diff < 365) %>%  
+  select(-date_diff) %>% 
+  mutate(IHD = 1)
+
+colnames(ihd_dbc)[colnames(ihd_dbc) == 'Begindatum_DBC'] <- 'date_criterion'
+ihd_dbc$date_criterion <- as.Date(ihd_dbc$date_criterion)
+
+```
+
+------------------------------------------------------------------------
+
+### 2. IHD-related laboratory results
+
+#### Troponin
+
+Troponin levels are indicators of myocardial damage. Here, we filter for Troponin measurements exceeding 45 ng/L according to the guidelines.
+
+```{r Lab, message=FALSE, warning=FALSE}
+
+ihd_lab_trop <- lab %>% 
+  filter(grepl("Trop", Bepaling, ignore.case=TRUE) & grepl("^[0-9]+$", UITSLAG))
+
+ihd_lab_trop$UITSLAG <- as.numeric(ihd_lab_trop$UITSLAG)
+
+ihd_lab_trop <- ihd_lab_trop %>%   
+  select(all_of(index_cols), Afname_dt, Bepaling, UITSLAG) %>% 
+  mutate(date_diff = as.Date(Afname_dt) - as.Date(indexdate)) %>% 
+  filter(date_diff > -1 & date_diff < 365) %>% 
+  mutate(IHD = ifelse(UITSLAG > 45, 1, 0))%>% 
+  distinct(studyId_0758, indexdate, Afname_dt, IHD) %>% 
+  filter(IHD==1)
+
+colnames(ihd_lab_trop)[colnames(ihd_lab_trop) == 'Afname_dt'] <- 'date_criterion'
+ihd_lab_trop$date_criterion <- as.Date(ihd_lab_trop$date_criterion)
+
+```
+
+#### CKMB
+
+Similarly, CKMB levels exceeding 8 µg/L are indicative of cardiac events. The following code filters for such cases.
+
+```{r, message=FALSE, warning=FALSE}
+
+ihd_lab_ckmb <- lab %>% 
+  filter(grepl("CKMB", Bepaling, ignore.case=TRUE) &
+           grepl("^[0-9]+(\\.[0-9]+)?$", UITSLAG))
+
+ihd_lab_ckmb$UITSLAG <- as.numeric(ihd_lab_ckmb$UITSLAG)
+
+ihd_lab_ckmb <- ihd_lab_ckmb %>%   
+  select(all_of(index_cols), Afname_dt, Bepaling, UITSLAG) %>% 
+  mutate(date_diff = as.Date(Afname_dt) - as.Date(indexdate)) %>% 
+  filter(date_diff > -1 & date_diff < 365) %>% 
+  mutate(IHD = ifelse( UITSLAG > 8, 1, 0))%>% 
+  distinct(studyId_0758, indexdate, Afname_dt, IHD) %>% 
+  filter(IHD==1)
+
+colnames(ihd_lab_ckmb)[colnames(ihd_lab_ckmb) == 'Afname_dt'] <- 'date_criterion'
+ihd_lab_ckmb$date_criterion <- as.Date(ihd_lab_ckmb$date_criterion)
+
+```
+
+------------------------------------------------------------------------
+
+### 3. IHD-related procedures
+
+IHD-related procedures are identified from a predefined list of codes excluding non-relevant labels. This section filters the procedures based on these criteria and restricts the timeframe.
+
+```{r Procedures, message=FALSE, warning=FALSE}
+
+# Checken - Cardioversie/Aorta/Kleppen
+
+verrichtingscodes <- verrichtingscodes %>% 
+  filter(Label != "cardioversie" & Label != "aorta" & Label != "kleppen" &  Label != "kunsthart" & Label != "dilatatie" & Label != "hartrevalidatie" & Label != "transplantatie" & Label != "cardiothoracaal" & Label != "catheterisatie")
+
+ihd_verr <- verrichtingen %>% 
+  filter(verr_code %in% verrichtingscodes$verr_code) %>% 
+  mutate(date_diff = as.Date(verr_date) - as.Date(indexdate)) %>% 
+  filter(date_diff > -1 & date_diff < 365) %>%  
+  mutate(IHD = 1) %>% 
+  distinct(studyId_0758, indexdate,verr_date, IHD)
+  
+colnames(ihd_verr)[colnames(ihd_verr) == 'verr_date'] <- 'date_criterion'
+ihd_verr$date_criterion <- as.Date(ihd_verr$date_criterion)
+
+```
+
+------------------------------------------------------------------------
+
+### 4. IHD-related diagnoses
+
+IHD-related diagnoses are identified from a column describing the diagnoses.
+
+```{r Diagnoses, message=FALSE, warning=FALSE}
+
+ihd_diag <- diagnose %>% 
+  filter(grepl("myocardinfarct|angina pectoris|coronair|pre-infarctsyndroom|pci|cabg",diag_omschrijving, ignore.case=TRUE)) %>% 
+  mutate(date_diff = as.Date(diag_reg_dt) - as.Date(indexdate)) %>% 
+  filter(date_diff > -1 & date_diff < 365) %>% 
+  mutate(IHD=1) %>% 
+  distinct(studyId_0758, indexdate, diag_reg_dt, IHD)
+
+colnames(ihd_diag)[colnames(ihd_diag) == 'diag_reg_dt'] <- 'date_criterion'
+ihd_diag$date_criterion <- as.Date(ihd_diag$date_criterion)
+
+```
+
+------------------------------------------------------------------------
+
+## Visualisation of cohort overlap
+
+A Venn diagram visually represents the overlap between different data sources for IHD selection. This helps in understanding how patients are distributed across the various selection criteria.
+
+```{r Comparison, echo=TRUE}
+
+#Make the plot
+p <-  ggVennDiagram(
+  x = list(
+    ihd_dbc %>% select(studyId_0758) %>% unlist(),
+    ihd_diag %>% select(studyId_0758) %>% unlist(), 
+    ihd_lab_trop  %>% select(studyId_0758) %>% unlist(),
+    ihd_lab_ckmb  %>% select(studyId_0758) %>% unlist(),
+    ihd_verr %>% select(studyId_0758) %>% unlist()
+    ),
+  category.names = c("DBC", "DIAGNOSES", "LAB_TROP", "LAB_CKMB","PROCEDURES"),
+  label="percent")
+
+p + scale_fill_distiller(palette="Reds", direction=1) +
+  theme(legend.position="none") + labs(title="Cohort Selection | Ischemic Heart Disease")
+
+
+```
+
+------------------------------------------------------------------------
+
+## Summary statistics of the cohorts
+
+This section provides summary statistics on various patient attributes, including the number of laboratory tests, diagnoses, and procedures, within the IHD cohorts. We use these measures as proxies of overall health, and compare them between the cohorts.
+
+```{r, message=FALSE, warning=FALSE}
+
+patient_data <- patients %>% 
+  select(all_of(meta_cols))
+
+colnames(patient_data)[colnames(patient_data) == 'aanmaakZD_date'] <- 'indexdate'
+
+# Combine data from different cohorts
+ihd_combined <- bind_rows(
+  ihd_dbc %>% mutate(Cohort = "DBC"),
+  ihd_diag %>% mutate(Cohort = "Diagnoses"),
+  ihd_lab_trop %>% mutate(Cohort = "Lab_Trop"),
+  ihd_lab_ckmb %>% mutate(Cohort = "Lab_CKMB"),
+  ihd_verr %>% mutate(Cohort = "Procedures")
+)
+
+ihd_combined$date_criterion <- as.Date(ihd_combined$date_criterion)
+
+# Join with patient data
+ihd_combined <- ihd_combined %>%
+  left_join(patient_data, relationship = "many-to-many")
+
+```
+
+#### Number of different laboratory tests after T0 and within 365 days 
+
+```{r, message=FALSE, warning=FALSE}
+
+lab_sum <- lab %>%  
+  mutate(date_diff = as.Date(Afname_dt) - as.Date(indexdate)) %>% 
+  filter(date_diff > -1 & date_diff < 365) %>% 
+  group_by(studyId_0758, indexdate) %>% 
+  summarise(N_lab = n_distinct(Bepaling), N_lab_sum = n()) %>% 
+  ungroup()
+
+```
+
+#### Number of different diagnoses after T0 and within 365 days
+
+```{r, message=FALSE, warning=FALSE}
+
+diag_sum <- diagnose %>%  
+  mutate(date_diff = as.Date(diag_start_dt) - as.Date(indexdate)) %>% 
+  filter(date_diff > -1 & date_diff < 365) %>% 
+  group_by(studyId_0758, indexdate) %>% 
+  summarise( N_diag = n_distinct(diag_omschrijving)) %>% 
+  ungroup()
+
+```
+
+#### Number of distinct prescribed medications (clinical) after T0 and within 365 days
+
+```{r, message=FALSE, warning=FALSE}
+
+med_klin_sum <- med_klin %>%  
+  mutate(date_diff = as.Date(med_vs_startdate) - as.Date(indexdate)) %>% 
+  filter(date_diff > -1 & date_diff < 365) %>% 
+  group_by(studyId_0758, indexdate) %>% 
+  summarise(N_med_klin = n_distinct(med_genNaam)) %>% 
+  ungroup()
+
+```
+
+#### Number of distinct prescribed medications (outpatient clinic) after T0 and within 365 days
+
+```{r, message=FALSE, warning=FALSE}
+
+med_poliklin_sum <- med_poliklin %>%  
+  mutate(date_diff = as.Date(med_vs_startdate) - as.Date(indexdate)) %>% 
+  filter(date_diff > -1 & date_diff < 365) %>% 
+  group_by(studyId_0758, indexdate) %>% 
+  summarise(N_med_poliklin = n_distinct(med_genNaam) ) %>% 
+  ungroup()
+
+```
+
+#### Number of distinct procedures after T0 and within 365 days
+
+```{r, message=FALSE, warning=FALSE}
+
+verr_sum <- verrichtingen %>%  
+  mutate( date_diff = as.Date(verr_date) - as.Date(indexdate)) %>% 
+  filter(date_diff > -1 & date_diff < 365) %>% 
+  group_by(studyId_0758, indexdate) %>% 
+  summarise(N_verr = n_distinct(verr_omschrijving)) %>% 
+  ungroup()
+
+```
+
+#### Summary table
+
+This section combines the summary statistics into one table.
+
+```{r}
+
+table_summary <- ihd_combined %>%
+  left_join(lab_sum) %>%
+  left_join(diag_sum) %>% 
+  left_join(med_klin_sum) %>% 
+  left_join(med_poliklin_sum) %>% 
+  left_join(verr_sum) %>% 
+  select(indexdate, Cohort, gender, age, N_lab, N_lab_sum, N_diag, N_med_klin, 
+         N_med_poliklin, N_verr) %>% 
+  tbl_summary(
+    by = Cohort, 
+    statistic = list(
+      indexdate ~ "{min} - {max}",
+      age ~ "{median} ({IQR})", 
+      gender ~ "{n} / {N} ({p}%)",
+      N_lab ~ "{median} ({IQR})",
+      N_lab_sum ~ "{median} ({IQR})",
+      N_diag ~ "{median} ({IQR})",
+      N_med_klin ~ "{median} ({IQR})",
+      N_med_poliklin ~ "{median} ({IQR})",
+      N_verr ~ "{median} ({IQR})"
+    ),
+    missing_text = "(Missing)",
+    label = list(
+      indexdate ~ "Index date",
+      age ~ "Age in years",
+      gender ~ "Sex",
+      N_lab ~ "# Unique laboratory tests (> 0 & < 366 days)",
+      N_lab_sum ~ "# Laboratory results (> 0 & < 366 days)",
+      N_diag ~ "# Unique diagnoses (> 0 & < 366 days)",
+      N_med_klin ~ "# Unique prescribed medications (> 0 & < 366 days)",
+      N_med_poliklin ~ "# Unique prescribed medications (outpatient) (> 0 & < 366 days)",
+      N_verr ~ "# Distinct procedures (> 0 & < 366 days)"
+    )
+  ) %>% 
+  bold_labels()
+table_summary
+
+```
+
+------------------------------------------------------------------------
+
+## Conclusion
+
+This document has outlined the method for constructing IHD cohorts using multiple clinical data sources.
+
+The use of different criteria leads to different cohorts. Within UMCU data, the DBC-based cohort is the largest and contains relatively young patients compared to the other cohorts. Of all selected patients, 33% have only an IHD-related DBC code with no subsequent IHD-related procedure, abnormal IHD-related lab measurement or IHD-related diagnosis, which might suggest that selection based only on DBCs leads to false positives.
+
+It is important to be aware of the selection bias pointed out here and properly combine the study question and appropriate criteria.
